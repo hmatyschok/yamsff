@@ -2398,18 +2398,7 @@ bridge_input(struct ifnet *ifp, struct mbuf *m)
 		m_freem(m);
 		return (NULL);
 	}	
-/*
- * Push back any by if_vether(4) received frame
- * for local processing. Those kind of interfaces
- * are designed to operate as data sink.
- *
- * Forwarding by if_vether(4) received frames 
- * with multi- / broadcast destination addresses
- * may cause (so called) broadcast storms.
- */
-	if (ifp->if_flags & IFF_VETHER) 
-		return (m);
-	
+
 	BRIDGE_LOCK(sc);
 	bif = bridge_lookup_member_if(sc, ifp);
 	if (bif == NULL) {
