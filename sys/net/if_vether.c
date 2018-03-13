@@ -1,7 +1,23 @@
 /*
- * Copyright (c) 2014, 2015 Henning Matyschok
- * All rights reserved.
+ * Copyright (c) 2009 Theo de Raadt
  *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+/*
+ * Copyright (c) 2018 Henning Matyschok
+ * All rights reserved.
+ * 
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
@@ -24,40 +40,38 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
  
-/*
- * Copyright (c) 2009 Theo de Raadt
- *
- * Permission to use, copy, modify, and distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- */
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/module.h>
-#include <sys/libkern.h>
 #include <sys/socket.h> 
 #include <sys/sockio.h>
-#include <sys/syslog.h>
-#include <sys/systm.h>
-#include <sys/sysctl.h>
 
 #include <net/if.h>
-#include <net/if_arp.h>
+#include <net/if_var.h>
 #include <net/if_clone.h>
+#include <net/if_dl.h>
 #include <net/if_media.h>
 #include <net/if_types.h>
 #include <net/bpf.h>
 #include <net/ethernet.h>
 #include <net/if_bridgevar.h>
-#include <net/if_llatbl.h>
+
+
+#define M_VETHER 	M_UNUSED_8
+
+/*
+ * Extract Link-Layer Adress [LLA].
+ */
+#define vether_sdl(ifa) \
+	((const struct sockaddr_dl *)(ifa)->ifa_addr)
+
+#define vether_lla(ifa) \
+	(vether_sdl(ifa)->sdl_data + vether_sdl(ifa)->sdl_nlen)
+	
+#define vether_lla_equal(ifa, lla) ( 	\
+	(vether_sdl(ifa)->sdl_type == IFT_ETHER) && \
+	(vether_sdl(ifa)->sdl_alen == sizeof(lla)) && \
+	(bcmp(vether_lla(ifa), lla, sizeof(lla)) == 0))
 
 /*
  * Virtual Ethernet interface, ported from OpenBSD. This interface 
@@ -70,7 +84,7 @@
  * Frame output: 
  * -------------
  *
- *  + inet_output()             + ng_ether_rcv_lower()
+ *  + xxx_output()              + ng_ether_rcv_lower()
  *  |                           |
  *  v                           | 
  *  + (*ifp0->if_output)()      |
@@ -81,11 +95,11 @@
  *       \                      |
  *        \                     + (*ifp0->if_start)()
  *         \                   /
- *          \     +-----------+ vether_start_locked()
+ *          \     +-----------+ vether_start()
  *           \   / 
  *            \ /
  *             + bridge_output(), selects NIC for tx frames
- *             |
+ *             | 
  *             + bridge_enqueue()  
  *             |
  *             + (*ifp->if_transmit)()
@@ -101,6 +115,8 @@
  *  v
  *  + (*ifp->if_input)(), NIC rx frame 
  *  |
+ *  + vether_bridge_input()
+ *  |
  *  + bridge_input()
  *  |                           
  *  + bridge_forward(), selects ifp0 denotes instance of if_vether(4)
@@ -109,51 +125,81 @@
  *  |
  *  + (*ifp0->if_transmit)()
  *   \            
- *    + vether_start_locked()
+ *    + vether_locked()
  *     \     
  *      + (*ifp0->if_input)() 
  *     / \
  *    /   +--->+ ng_ether_input()  
  *   /
- *  + bridge_input(), but forwarding is stalled by
- *  |           
- *  |                  if (ifp0->if_type == IFT_VETHER)
- *  |                          return (m);
+ *  + bridge_input()
+ *  |
  *  v
  *  + ether_demux() 
  */
 struct vether_softc {
-	struct ifnet	*sc_ifp;	/* network interface. */
-	struct mtx	sc_mtx;	
+	struct ifnet	*sc_ifp;	/* network interface. */	
 	struct ifmedia	sc_ifm;		/* fake media information */
-	int	sc_status;
-	LIST_ENTRY(vether_softc) vether_list;
 };
-#define	VETHER_LOCK_INIT(sc)	mtx_init(&(sc)->sc_mtx, "vether softc",	\
-				     NULL, MTX_DEF)
-#define	VETHER_LOCK_DESTROY(sc)	mtx_destroy(&(sc)->sc_mtx)
-#define	VETHER_LOCK(sc)		mtx_lock(&(sc)->sc_mtx)
-#define	VETHER_UNLOCK(sc)		mtx_unlock(&(sc)->sc_mtx)
-#define	VETHER_LOCK_ASSERT(sc)	mtx_assert(&(sc)->sc_mtx, MA_OWNED)	
+
+#define VETHER_IF_FLAGS 	\
+	(IFF_SIMPLEX|IFF_BROADCAST|IFF_MULTICAST)
+#define VETHER_IFCAP_FLAGS 	(IFCAP_VLAN_MTU|IFCAP_JUMBO_MTU)
+#define VETHER_IFM_FLAGS 	(IFM_ETHER|IFM_AUTO)
+
+
+static void 	vether_init(void *);
+static void 	vether_stop(struct ifnet *, int);
+static void 	vether_start(struct ifnet *);
+
+static int 	vether_media_change(struct ifnet *);
+static void 	vether_media_status(struct ifnet *, struct ifmediareq *);
+static int 	vether_ioctl(struct ifnet *, u_long, caddr_t);
 
 static int	vether_clone_create(struct if_clone *, int, caddr_t);
-static void	vether_clone_destroy(struct ifnet *);
- 
+static void 	vether_clone_destroy(struct ifnet *);
+
+/*
+ * SAP for if_clone(4) facility.
+ */
 static struct if_clone *vether_cloner;
 static const char vether_name[] = "vether";
 
-static LIST_HEAD(, vether_softc) vether_list;
+/*
+ * Module event handler.
+ */
+static int
+vether_mod_event(module_t mod, int event, void *data)
+{
+	int error = 0;
+ 
+	switch (event) {
+	case MOD_LOAD:
+/*
+ * Attach if_cloner(4).
+ */		
+		vether_cloner = if_clone_simple(vether_name,
+			vether_clone_create, vether_clone_destroy, 0);
+		break;
+	case MOD_UNLOAD:		
+		if_clone_detach(vether_cloner);
+		
+		break;
+	default:
+		error = EOPNOTSUPP;
+	}
+ 
+	return (error);
+} 
 
-static struct mtx vether_list_mtx;
-
-static void	vether_init(void *);
-static void	vether_stop(struct ifnet *, int);
-static void	vether_start_locked(struct vether_softc *,struct ifnet *);
-static void	vether_start(struct ifnet *);
-
-static int	vether_media_change(struct ifnet *);
-static void	vether_media_status(struct ifnet *, struct ifmediareq *);
-static int	vether_ioctl(struct ifnet *, u_long, caddr_t);
+/*
+ * Module desccription.
+ */
+static moduledata_t vether_mod = {
+	"if_vether",
+	vether_mod_event,
+	0
+};
+DECLARE_MODULE(if_vether, vether_mod, SI_SUB_PSEUDO, SI_ORDER_ANY);
 
 /*
  * Ctor.
@@ -162,67 +208,89 @@ static int
 vether_clone_create(struct if_clone *ifc, int unit, caddr_t data)
 {
 	struct vether_softc *sc;
-	struct ifnet *ifp;	
-	uint32_t randval;
+	struct ifnet *ifp, *iter;
 	uint8_t	lla[ETHER_ADDR_LEN];
+	int error;
 /*
  * Allocate software context.
  */ 
-	sc = malloc(sizeof(struct vether_softc), M_DEVBUF, M_WAITOK|M_ZERO);
+	sc = malloc(sizeof(struct vether_softc), 
+		M_DEVBUF, M_WAITOK|M_ZERO); 	/* can't fail */
 	ifp = sc->sc_ifp = if_alloc(IFT_ETHER);
 	if (ifp == NULL) {
 		free(sc, M_DEVBUF);
-		return (ENOSPC);
+		error = ENOSPC;
+		goto out;
 	}
 	if_initname(ifp, vether_name, unit);
 /*
  * Bind software context.
- */ 	
-	VETHER_LOCK_INIT(sc);
+ */ 
 	ifp->if_softc = sc;
 /*
- * Initialize specific attributes.
+ * Initialize its attributes.
  */ 
 	ifp->if_init = vether_init;
 	ifp->if_ioctl = vether_ioctl;
 	ifp->if_start = vether_start;
+
+ 	ifp->if_flags = VETHER_IF_FLAGS;
  
- 	ifp->if_snd.ifq_maxlen = ifqmaxlen;
- 	ifp->if_flags = (IFF_SIMPLEX|IFF_BROADCAST|IFF_MULTICAST|IFF_VETHER);
- 
-	ifp->if_capabilities = IFCAP_VLAN_MTU|IFCAP_JUMBO_MTU;
-	ifp->if_capenable = IFCAP_VLAN_MTU|IFCAP_JUMBO_MTU;
+	ifp->if_capabilities = VETHER_IFCAP_FLAGS;
+	ifp->if_capenable = VETHER_IFCAP_FLAGS;
 	
-	ifmedia_init(&sc->sc_ifm, 0, vether_media_change, vether_media_status);
-	ifmedia_add(&sc->sc_ifm, IFM_ETHER|IFM_AUTO, 0, NULL);
-	ifmedia_set(&sc->sc_ifm, IFM_ETHER|IFM_AUTO);
- 	
- 	sc->sc_status = IFM_AVALID;
+	ifmedia_init(&sc->sc_ifm, 0, vether_media_change, 
+		vether_media_status);
+	ifmedia_add(&sc->sc_ifm, VETHER_IFM_FLAGS, 0, NULL);
+	ifmedia_set(&sc->sc_ifm, VETHER_IFM_FLAGS);
 /*
- * Generate randomized lla.  
- */
-	lla[0] = 0x0;
-	randval = arc4random();
-	memcpy(&lla[1], &randval, sizeof(uint32_t));
-	lla[5] = (uint8_t)unit; /* Interface major number */
-/*
- * Initialize ethernet specific attributes and perform inclusion 
- * mapping on link layer, netgraph(4) domain and generate by bpf(4) 
- * implemented Inspection Access Point maps to by ifnet(9) defined 
- * generic interface.
+ * Create random LLA and initialize.
  */ 	
- 	ether_ifattach(ifp, lla);
- 	ifp->if_baudrate = 0;
+
+again:	
+
+/*
+ * Map prefix on LLA.  
+ */	
+	lla[0] = 0x0;
+/*
+ * Map randomized infix on LLA.  
+ */	
+	arc4rand(&lla[1], sizeof(uint32_t), 0);		
+/* 
+ * Map interface major number as postfix on LLA. 
+ */
+	lla[5] = (uint8_t)unit;
+/*
+ * Find out, if LLA is unique.
+ */
+	IFNET_RLOCK_NOSLEEP();
+	TAILQ_FOREACH(iter, &V_ifnet, if_link) {
+		
+		if (iter->if_type != IFT_ETHER)
+			continue;
+
+		if (vether_lla_equal(iter->if_addr, lla)) {
+			IFNET_RUNLOCK_NOSLEEP();
+			goto again;
+		}
+	}
+	IFNET_RUNLOCK_NOSLEEP();
+/*
+ * Initialize ethernet specific attributes, perform 
+ * inclusion mapping on link layer and finally by 
+ * bpf(4) implemented Inspection Access Point [IAP].
+ */	
+	ether_ifattach(ifp, lla);
  
-	mtx_lock(&vether_list_mtx);
-	LIST_INSERT_HEAD(&vether_list, sc, vether_list);
-	mtx_unlock(&vether_list_mtx);
+ 	ifp->if_baudrate = 0;
 
 	ifp->if_drv_flags |= IFF_DRV_RUNNING;
- 
-	return (0);
+	error = 0;
+out: 
+	return (error);
 }
-
+ 
 /*
  * Dtor.
  */
@@ -231,17 +299,9 @@ vether_clone_destroy(struct ifnet *ifp)
 {
 	struct vether_softc *sc;	
 	
-	sc = ifp->if_softc;	
- 
-	VETHER_LOCK(sc);
 	vether_stop(ifp, 1);
 	
-	ifp->if_flags &= ~IFF_UP;	
-	VETHER_UNLOCK(sc);		
-
-	mtx_lock(&vether_list_mtx);
-	LIST_REMOVE(sc, vether_list);
-	mtx_unlock(&vether_list_mtx);	
+	ifp->if_flags &= ~IFF_UP;
 /*
  * Inverse element of ether_ifattach.
  */
@@ -251,133 +311,10 @@ vether_clone_destroy(struct ifnet *ifp)
  */	
 	if_free(ifp);
 	
-	VETHER_LOCK_DESTROY(sc);
+	sc = ifp->if_softc;
 	free(sc, M_DEVBUF);
 }
  
-/*
- * Initializes interface.
- */
-static void
-vether_init(void *xsc)
-{
-	struct vether_softc *sc = (struct vether_softc *)xsc;
-	struct ifnet *ifp;
- 
-	VETHER_LOCK(sc);
-	ifp = sc->sc_ifp;
-	ifp->if_drv_flags |= IFF_DRV_RUNNING;
-	ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
-	VETHER_UNLOCK(sc);
-}
- 
-/*
- * Stops focussed instance of if_vether(4).
- */
-static void
-vether_stop(struct ifnet *ifp, int disable)
-{
-	struct vether_softc *sc;
-	
-	sc = ifp->if_softc;
-	VETHER_LOCK_ASSERT(sc);
-	ifp->if_drv_flags &= ~IFF_DRV_RUNNING;
-}	
- 
-/*
- * I/O.
- */
-static void
-vether_start(struct ifnet *ifp)
-{
-	struct vether_softc	*sc = ifp->if_softc;
-
-	VETHER_LOCK(sc);
-	vether_start_locked(sc, ifp);
-	VETHER_UNLOCK(sc);
-}
-
-static void
-vether_start_locked(struct vether_softc	*sc, struct ifnet *ifp)
-{
-	struct mbuf *m;
-	int error;
-
-	VETHER_LOCK_ASSERT(sc);
-	
-	ifp->if_drv_flags |= IFF_DRV_OACTIVE;
-	for (;;) {
-		IFQ_DEQUEUE(&ifp->if_snd, m);
-		if (m == NULL) 
-			break;
-			
-		if ((m->m_flags & M_PKTHDR) == 0) {
-			m_freem(m);
-			continue;
-		}
-		
-		if (m->m_pkthdr.rcvif == NULL) {
-/*
- * IAP for transmission.
- */				
-			ETHER_BPF_MTAP(ifp, m);
-			ifp->if_opackets++;	
-/* 
- * Discard any frame, if not if_bridge(4) member.
- */				
-			if (ifp->if_bridge == NULL) {
-				m_freem(m);
-				continue;
-			}			
-/* 
- * Discard any frame, if monitoring is enabled.
- */		
-			if (ifp->if_flags & IFF_MONITOR) {
-				m_freem(m);
-				continue;
-			}
-/* 
- * Discard, if frame not passed ng_ether_rcv_lower.
- */
-			if ((m->m_flags & M_PROTO2) == 0) {
-				m_freem(m);
-				continue;
-			}
-			m->m_flags &= ~M_PROTO2;
-			m->m_pkthdr.rcvif = ifp;			
-/*
- * Broadcast frame via if_bridge(4).
- */			
-			BRIDGE_OUTPUT(ifp, m, error);	
-		} else if (m->m_pkthdr.rcvif != ifp) {
-/*
- * IAP for reception.
- */				
-			ETHER_BPF_MTAP(ifp, m);	
-			ifp->if_ipackets++;	
-/* 
- * Discard any frame, if monitoring is enabled.
- */		
-			if (ifp->if_flags & IFF_MONITOR) {
-				m_freem(m);
-				continue;
-			}
-			m->m_pkthdr.rcvif = ifp;
-/*
- * Demultiplex frame by ether_input.
- */	
-			(*ifp->if_input)(ifp, m);
-		} else {
-/*
- * Discard any duplicated frame.
- */ 		
-			m_freem(m);
-			continue;
-		}		
-	}								
-	ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
-}
-
 /*
  * Media types can't be changed.
  */
@@ -412,7 +349,6 @@ vether_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	}
 	return (error);
 } 
-
 static int
 vether_media_change(struct ifnet *ifp)
 {
@@ -424,38 +360,93 @@ vether_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 {
 	ifmr->ifm_active = IFM_ETHER|IFM_AUTO;
 	ifmr->ifm_status = IFM_AVALID|IFM_ACTIVE;
-}
-
-/*
- * Module event handler.
- */
-static int
-vether_mod_event(module_t mod, int event, void *data)
-{
-	int error = 0;
- 
-	switch (event) {
-	case MOD_LOAD:
-		mtx_init(&vether_list_mtx, "if_vether_list", NULL, MTX_DEF);
-		vether_cloner = if_clone_simple(vether_name,
-			vether_clone_create, vether_clone_destroy, 0);
-		break;
-	case MOD_UNLOAD:	
-		if_clone_detach(vether_cloner);
-		mtx_destroy(&vether_list_mtx);
-		break;
-	default:
-		error = EOPNOTSUPP;
-	}
- 
-	return (error);
 } 
  
-static moduledata_t vether_mod = {
-	"if_vether",
-	vether_mod_event,
-	0
-};
-DECLARE_MODULE(if_vether, vether_mod, SI_SUB_PSEUDO, SI_ORDER_ANY);
-MODULE_DEPEND(if_vether, ether, 1, 1, 1);
+/*
+ * Initializes interface.
+ */
+static void
+vether_init(void *xsc)
+{
+	struct vether_softc *sc = (struct vether_softc *)xsc;
+	struct ifnet *ifp;
+ 
+	ifp = sc->sc_ifp;
+	
+	ifp->if_drv_flags |= IFF_DRV_RUNNING;
+	ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
+}
+ 
+/*
+ * Stops focussed instance of if_vether(4).
+ */
+static void
+vether_stop(struct ifnet *ifp, int disable)
+{
+	
+	ifp->if_drv_flags &= ~IFF_DRV_RUNNING;
+}	
+ 
+/*
+ * I/O.
+ */
 
+static void
+vether_start(struct ifnet *ifp)
+{
+	struct mbuf *m;
+	
+	ifp->if_drv_flags |= IFF_DRV_OACTIVE;
+	for (;;) {
+		IFQ_DEQUEUE(&ifp->if_snd, m);
+		if (m == NULL) 
+			break;
+
+		if ((m->m_flags & M_PKTHDR) == 0) {
+			m_freem(m);
+			continue;
+		}			
+		BPF_MTAP(ifp, m);	
+/* 
+ * Discard any frame, if not member of if_bridge(4).
+ */				
+		if (ifp->if_bridge == NULL) {
+			m_freem(m);
+			continue;
+		}
+/*
+ * Three cases are considered here:
+ * 
+ *  (a) Frame was tx'd by layer above.
+ * 
+ *  (b) Frame was rx'd by link-layer.
+ * 
+ *  (c) Data sink.
+ */ 				
+		if (m->m_pkthdr.rcvif == NULL) {			
+			m->m_pkthdr.rcvif = ifp;					 
+/*
+ * Broadcast frame by if_bridge(4).
+ */
+			KASSERT(bridge_output_p != NULL,			
+				("%s: if_bridge not loaded!", __func__));
+				
+			if ((*bridge_output_p)(ifp, m, NULL, NULL) != 0) {
+/*
+ * Discard mbuf(9) as exception handling, when error 
+ * condition because of changed implementation could
+ * occour, see net/if_bridge.c for further details.
+ */				
+				m_freem(m);
+			} 
+		} else if (m->m_pkthdr.rcvif != ifp) {
+			m->m_pkthdr.rcvif = ifp;	
+/*
+ * Demultiplex any other frame.
+ */	
+			(*ifp->if_input)(ifp, m);
+		} else
+			m_freem(m);
+	}								
+	ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
+}
