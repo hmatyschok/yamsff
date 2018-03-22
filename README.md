@@ -989,7 +989,7 @@ Legal Notice:
    
   (b) OpenBSD is a trademark of Theo DeRaadt.  
 </code></pre>
-[![Flattr this git repo](http://api.flattr.com/button/flattr-badge-large.png)](https://flattr.com/submit/auto?user_id=hmatyschok&url=https://github.com/hmatyschok/MeshBSD&title=MeshBSD&language=&tags=github&category=software) Please feel free to support me anytime, because it is hard to get a job [e. g. software developement, etc.] in Germany. 
+[![Flattr this git repo](http://api.flattr.com/button/flattr-badge-large.png)](https://flattr.com/submit/auto?user_id=hmatyschok&url=https://github.com/hmatyschok/MeshBSD&title=MeshBSD&language=&tags=github&category=software) 
  
  
  
